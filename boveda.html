@@ -147,6 +147,40 @@ function writeBlob(s) {
   memBlob = s;
   try { if (s == null) localStorage.removeItem(STORE); else localStorage.setItem(STORE, s); storageOk = true; }
   catch (e) { storageOk = false; }
+  return pushRemote(s);
+}
+/* The encrypted blob is also kept in the owner's private account space, because
+   iPhone browsers discard this page's local storage when the app closes. */
+let vaultRef = null, remoteOk = false;
+const CHUNK = 150000;
+async function pushRemote(s) {
+  if (!vaultRef) return;
+  try {
+    if (s == null) { await vaultRef('vault').delete(); remoteOk = true; return; }
+    const n = Math.ceil(s.length / CHUNK);
+    for (let i = 0; i < n; i++) await vaultRef('p' + i).set({ s: s.slice(i * CHUNK, (i + 1) * CHUNK) });
+    await vaultRef('vault').set({ n, at: new Date().toISOString() });
+    remoteOk = true;
+  } catch (e) { remoteOk = false; }
+}
+async function initRemote() {
+  try {
+    if (!(window.claude && window.claude.use)) return;
+    const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+    const id = db && user && await user.id();
+    if (!id) return;
+    vaultRef = k => db.collection('data/users/' + id).doc(k);
+    const meta = await vaultRef('vault').get();
+    remoteOk = true;
+    if (meta.exists) {
+      const n = meta.data().n || 0;
+      const parts = await Promise.all(Array.from({ length: n }, (_, i) => vaultRef('p' + i).get()));
+      const s = parts.map(p => (p.exists ? p.data().s : '')).join('');
+      if (validBlob(s)) { memBlob = s; try { localStorage.setItem(STORE, s); } catch (e) {} return; }
+    }
+    const local = readBlob();
+    if (validBlob(local)) await pushRemote(local);
+  } catch (e) { remoteOk = false; }
 }
 function validBlob(s) {
   try { const o = JSON.parse(s); return o && o.app === 'boveda' && o.salt && o.iv && o.ct ? o : null; } catch (e) { return null; }
@@ -167,7 +201,8 @@ function persist() {
   saving = saving.then(async () => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, enc.encode(snapshot));
-    writeBlob(JSON.stringify({ app: 'boveda', v: 1, salt: b64(s), iv: b64(iv), ct: b64(ct) }));
+    await writeBlob(JSON.stringify({ app: 'boveda', v: 1, salt: b64(s), iv: b64(iv), ct: b64(ct) }));
+    const warn = document.getElementById('save-warn'); if (warn) warn.hidden = remoteOk;
   }).catch(() => { storageOk = false; });
   return saving;
 }
@@ -236,7 +271,7 @@ function renderLock(msg) {
       : 'La clave no se guarda en ningún lado. Si la olvidas, no hay forma de recuperar tus datos.' })
   );
   app.replaceChildren(el('div', { class: 'wrap lockscreen' },
-    el('div', { class: 'eyebrow', text: 'Privada · cifrada en este celular' }),
+    el('div', { class: 'eyebrow', text: 'Privada · cifrada con tu clave' }),
     el('h1', { text: 'Bóveda personal' }),
     form,
     restoreCard(exists)
@@ -274,7 +309,7 @@ function render() {
       el('div', { class: 'brand', text: 'Bóveda' }),
       el('button', { class: 'btn small', type: 'button', text: 'Bloquear', onclick: lock }))),
     el('main', { class: 'wrap' },
-      !storageOk && el('div', { class: 'banner', role: 'alert', text: 'Este navegador no está guardando los datos. Lo que escribas se perderá al cerrar. Haz una copia en Ajustes.' }),
+      el('div', { id: 'save-warn', class: 'banner', role: 'alert', hidden: remoteOk, text: 'No se pudo guardar en tu cuenta. En iPhone los datos pueden perderse al cerrar la app. Haz una copia en Ajustes.' }),
       views[tab]()),
     el('nav', { 'aria-label': 'Secciones' }, el('div', { class: 'wrap' }, TABS.map(([id, label]) =>
       el('button', { type: 'button', text: label, 'aria-current': tab === id ? 'page' : null, onclick: () => { tab = id; editing = null; render(); window.scrollTo(0, 0); } }))))
@@ -490,23 +525,27 @@ function viewSettings() {
     el('h2', { text: 'Ajustes' }),
     el('div', { class: 'card' },
       el('div', { class: 'eyebrow', text: 'Copia de seguridad' }),
-      el('p', { style: 'margin:0', text: 'Tus datos viven solo en el navegador de este celular. Si borras los datos del navegador o cambias de teléfono, se pierden. Guarda una copia de vez en cuando.' }),
+      el('p', { style: 'margin:0', text: remoteOk
+        ? 'Tu bóveda se guarda cifrada en tu cuenta de Claude, así que la ves en cualquier dispositivo donde abras esta app. Nadie puede leerla sin tu clave. Una copia aparte sigue siendo buena idea.'
+        : 'Ahora mismo tus datos solo están en este navegador y pueden perderse al cerrarlo. Guarda una copia.' }),
       el('div', { class: 'row' }, exportBtn), ta, note,
       el('p', { class: 'muted sm', style: 'margin:0', text: 'Para restaurar: bloquea la bóveda y usa "Restaurar una copia de seguridad" en la pantalla de inicio.' })),
     el('div', { class: 'card' },
       el('div', { class: 'eyebrow', text: 'Cómo se protege' }),
       el('div', { class: 'list' },
         el('div', { class: 'item' }, el('span', { text: 'Cifrado' }), el('span', { class: 'muted', text: 'AES-256 con tu clave' })),
-        el('div', { class: 'item' }, el('span', { text: 'Dónde se guarda' }), el('span', { class: 'muted', text: 'Solo en este celular' })),
+        el('div', { class: 'item' }, el('span', { text: 'Dónde se guarda' }), el('span', { class: 'muted', text: remoteOk ? 'Tu cuenta de Claude, cifrado' : 'Solo este navegador' })),
         el('div', { class: 'item' }, el('span', { text: 'Bloqueo automático' }), el('span', { class: 'muted', text: '5 minutos sin uso' })),
         el('div', { class: 'item' }, el('span', { text: 'Contenido' }), el('span', { class: 'muted', text: data.notes.length + ' notas · ' + data.records.length + ' datos · ' + data.moves.length + ' movimientos' })))),
     el('div', { class: 'card' },
       el('div', { class: 'eyebrow', text: 'Zona de riesgo' }),
-      el('p', { style: 'margin:0', text: 'Borra la bóveda de este celular. No se puede deshacer.' }),
+      el('p', { style: 'margin:0', text: 'Borra la bóveda de este celular y de tu cuenta. No se puede deshacer.' }),
       el('div', { class: 'row' }, wipe))
   ];
 }
 
-renderLock();
+app.replaceChildren(el('div', { class: 'wrap lockscreen' },
+  el('h1', { text: 'Bóveda personal' }), el('p', { class: 'muted', text: 'Buscando tu bóveda…' })));
+Promise.race([initRemote(), new Promise(r => setTimeout(r, 12000))]).then(() => { if (!key) renderLock(); });
 })();
 </script>
